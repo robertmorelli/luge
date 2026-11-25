@@ -1,0 +1,822 @@
+//! luge — standalone Wasm-to-Wasm loop tier-up outliner written in Utu.
+//!
+//! Outlines outermost loops in a Wasm binary into helper functions with an
+//! exponential-backoff `return_call` to themselves (`cnt == next`, `next <<= 1`)
+//! so V8 (Liftoff -> TurboFan) and SpiderMonkey (Baseline -> Ion) can tier up
+//! single-call hot loops mid-run.
+
+export mem inp: U8
+export mem out: U8
+
+/// Scratch buffer for building sections & function bodies
+vec buf: U8
+/// Scratch buffer for rewritten caller body
+vec body_buf: U8
+/// Scratch buffer for new helper bodies (appended to Code section)
+vec new_bodies: U8
+vec new_body_start: I32
+vec new_body_len: I32
+
+/// Parsed Type section entries (raw bytes) + param/result valtypes for 0x60 func types
+vec type_raw_start: I32
+vec type_raw_len: I32
+vec type_is_func: U8
+vec type_p_start: I32
+vec type_p_len: I32
+vec type_r_start: I32
+vec type_r_len: I32
+vec type_vals: U8
+
+/// Newly added helper types (stored as raw type bytes in `new_types`)
+vec new_types: U8
+let new_type_count: I32 = 0
+
+/// Section table (in original module order)
+vec sec_id: U8
+vec sec_start: I32
+vec sec_len: I32
+
+/// Function section (type index per defined function) + newly added helpers
+vec func_type_idx: I32
+vec new_func_type_idx: I32
+
+/// Code section (raw body ranges per defined function)
+vec code_start: I32
+vec code_len: I32
+
+/// Per-function analysis tables
+vec loc_types: U8
+vec in_read: I32
+vec in_write: I32
+vec out_read: I32
+vec loc_map: I32
+vec h_params: I32
+vec h_outs: I32
+
+/// Candidate loop regions in current function
+vec cand_reg_start: I32
+vec cand_reg_end: I32
+vec cand_loop_body: I32
+vec cand_loop_end: I32
+vec cand_wrapped: U8
+
+let inp_len: I32 = 0
+let cur_pos: I32 = 0
+let num_imp_funcs: I32 = 0
+let g_outlined: I32 = 0
+let g_threshold: I32 = 1024
+
+// ── LEB128 helpers ───────────────────────────────────────────────────────────
+
+fn read_u8() I32 {
+    let b = inp[cur_pos]
+    cur_pos += 1
+    return b
+}
+
+fn read_u32() I32 {
+    let res = 0
+    let shift = 0
+    while (cur_pos < inp_len) {
+        let b = inp[cur_pos]
+        cur_pos += 1
+        res = res | ((b & 127) << shift)
+        if (b & 128) == 0 { return res }
+        shift += 7
+    }
+    return res
+}
+
+fn skip_leb() Void {
+    while (cur_pos < inp_len) {
+        let b = inp[cur_pos]
+        cur_pos += 1
+        if (b & 128) == 0 { return }
+    }
+}
+
+fn push_u32(v: I32) Void {
+    let x = v
+    while (true) {
+        let b = x & 127
+        x = x >>> 7
+        if x != 0 {
+            buf.push((b | 128))
+        } else {
+            buf.push(b)
+            return
+        }
+    }
+}
+
+fn push_s32(v: I32) Void {
+    let x = v
+    while (true) {
+        let b = x & 127
+        x = x >> 7
+        let done = (x == 0 and (b & 64) == 0) or (x == -1 and (b & 64) != 0)
+        if not done {
+            buf.push((b | 128))
+        } else {
+            buf.push(b)
+            return
+        }
+    }
+}
+
+fn out_u32(v: I32) Void {
+    let x = v
+    while (true) {
+        let b = x & 127
+        x = x >>> 7
+        if x != 0 {
+            out.push((b | 128))
+        } else {
+            out.push(b)
+            return
+        }
+    }
+}
+
+fn body_push_u32(v: I32) Void {
+    let x = v
+    while (true) {
+        let b = x & 127
+        x = x >>> 7
+        if x != 0 {
+            body_buf.push((b | 128))
+        } else {
+            body_buf.push(b)
+            return
+        }
+    }
+}
+
+fn body_push_s32(v: I32) Void {
+    let x = v
+    while (true) {
+        let b = x & 127
+        x = x >> 7
+        let done = (x == 0 and (b & 64) == 0) or (x == -1 and (b & 64) != 0)
+        if not done {
+            body_buf.push((b | 128))
+        } else {
+            body_buf.push(b)
+            return
+        }
+    }
+}
+
+fn new_types_push_u32(v: I32) Void {
+    let x = v
+    while (true) {
+        let b = x & 127
+        x = x >>> 7
+        if x != 0 {
+            new_types.push((b | 128))
+        } else {
+            new_types.push(b)
+            return
+        }
+    }
+}
+
+// ── Wasm section parsing ─────────────────────────────────────────────────────
+
+fn parse_type_section(start: I32, length: I32) Void {
+    cur_pos = start
+    let count = read_u32()
+    #luge
+    for (0 ..< count) |_| {
+        let e_start = cur_pos
+        let form = read_u8()
+        if form == 96 { // 0x60 func type
+            type_is_func.push(1)
+            let np = read_u32()
+            type_p_start.push(type_vals.len())
+            type_p_len.push(np)
+            for (0 ..< np) |_| { type_vals.push(read_u8()) }
+            let nr = read_u32()
+            type_r_start.push(type_vals.len())
+            type_r_len.push(nr)
+            for (0 ..< nr) |_| { type_vals.push(read_u8()) }
+        } else {
+            // Non-MVP type section (e.g. GC rec/struct): bail out by marking non-func
+            type_is_func.push(0)
+            type_p_start.push(0)
+            type_p_len.push(0)
+            type_r_start.push(0)
+            type_r_len.push(0)
+            cur_pos = start + length
+        }
+        type_raw_start.push(e_start)
+        type_raw_len.push(cur_pos - e_start)
+    }
+}
+
+fn skip_limits() Void {
+    let flags = read_u8()
+    skip_leb()
+    if (flags & 1) != 0 { skip_leb() }
+}
+
+fn parse_import_section(start: I32) Void {
+    cur_pos = start
+    let count = read_u32()
+    #luge
+    for (0 ..< count) |_| {
+        let mlen = read_u32()
+        cur_pos += mlen
+        let nlen = read_u32()
+        cur_pos += nlen
+        let kind = read_u8()
+        if kind == 0 {
+            skip_leb() // func type idx
+            num_imp_funcs += 1
+        } else if kind == 1 {
+            cur_pos += 1 // elemtype
+            skip_limits()
+        } else if kind == 2 {
+            skip_limits()
+        } else if kind == 3 {
+            cur_pos += 2 // valtype + mut
+        } else if kind == 4 {
+            cur_pos += 1 // attr
+            skip_leb()
+        }
+    }
+}
+
+fn parse_function_section(start: I32) Void {
+    cur_pos = start
+    let count = read_u32()
+    #luge
+    for (0 ..< count) |_| {
+        func_type_idx.push(read_u32())
+    }
+}
+
+fn parse_code_section(start: I32) Void {
+    cur_pos = start
+    let count = read_u32()
+    #luge
+    for (0 ..< count) |_| {
+        let blen = read_u32()
+        code_start.push(cur_pos)
+        code_len.push(blen)
+        cur_pos += blen
+    }
+}
+
+// ── Wasm instruction decoder ─────────────────────────────────────────────────
+
+/// Returns next byte position after the instruction at `pos`, or -1 if unsupported.
+fn step_instr(pos: I32, end: I32) I32 {
+    if pos >= end { return -1 }
+    let op = inp[pos]
+    cur_pos = pos + 1
+    // Control flow with blocktype
+    if op == 2 or op == 3 or op == 4 {
+        let bt = inp[cur_pos]
+        if bt == 64 or (bt >= 124 and bt <= 127) {
+            cur_pos += 1
+        } else {
+            skip_leb()
+        }
+        return cur_pos
+    }
+    // 0-immediate opcodes: unreachable, nop, else, end, return, drop, select,
+    // numeric ops (0x45..0xc4)
+    if op == 0 or op == 1 or op == 5 or op == 11 or op == 15 or op == 26 or op == 27 {
+        return cur_pos
+    }
+    if op >= 69 and op <= 196 {
+        return cur_pos
+    }
+    // 1 u32 LEB: br, br_if, call, return_call, local.*, global.*, memory.size/grow
+    if op == 12 or op == 13 or op == 16 or op == 18 or (op >= 32 and op <= 36) or op == 63 or op == 64 {
+        skip_leb()
+        return cur_pos
+    }
+    // br_table
+    if op == 14 {
+        let n = read_u32()
+        for (0 ..< n + 1) |_| { skip_leb() }
+        return cur_pos
+    }
+    // 2 u32 LEBs: call_indirect, return_call_indirect, loads/stores (0x28..0x3e)
+    if op == 17 or op == 19 or (op >= 40 and op <= 62) {
+        skip_leb()
+        skip_leb()
+        return cur_pos
+    }
+    // i32.const / i64.const
+    if op == 65 or op == 66 {
+        skip_leb()
+        return cur_pos
+    }
+    // f32.const / f64.const
+    if op == 67 { return cur_pos + 4 }
+    if op == 68 { return cur_pos + 8 }
+    // 0xfc prefix (trunc_sat, bulk memory/table)
+    if op == 252 {
+        let sub = read_u32()
+        if sub <= 7 { return cur_pos }
+        if sub == 8 or sub == 10 or sub == 12 or sub == 14 {
+            skip_leb()
+            skip_leb()
+            return cur_pos
+        }
+        if sub == 9 or sub == 11 or sub == 13 or (sub >= 15 and sub <= 17) {
+            skip_leb()
+            return cur_pos
+        }
+        return -1
+    }
+    return -1
+}
+
+fn is_mvp_valtype(t: I32) Bool => t == 127 or t == 126 or t == 125 or t == 124
+
+/// Check if an instruction range [start, end) is safe to outline:
+/// - All opcodes supported
+/// - No `return`, `return_call`, `return_call_indirect`
+/// - No `br`/`br_if`/`br_table` escaping past `max_depth` (0 for standalone loop, 1 for block+loop)
+fn check_region_safe(start: I32, end: I32, base_depth: I32) Bool {
+    let pos = start
+    let depth = base_depth
+    #luge
+    while (pos < end) {
+        let op = inp[pos]
+        if op == 15 or op == 18 or op == 19 { return false } // return / return_call*
+        if op == 2 or op == 3 or op == 4 {
+            depth += 1
+        } else if op == 11 {
+            depth -= 1
+            if depth < 0 { return false }
+        } else if op == 12 or op == 13 {
+            cur_pos = pos + 1
+            let lbl = read_u32()
+            if lbl > depth { return false }
+        } else if op == 14 {
+            cur_pos = pos + 1
+            let n = read_u32()
+            for (0 ..< n + 1) |_| {
+                let lbl = read_u32()
+                if lbl > depth { return false }
+            }
+        }
+        let nxt = step_instr(pos, end)
+        if nxt < 0 { return false }
+        pos = nxt
+    }
+    return true
+}
+
+/// Find outermost loop candidates in [expr_start, expr_end) (excluding final function `end`).
+fn find_candidates(expr_start: I32, expr_end: I32) Bool {
+    cand_reg_start.clear()
+    cand_reg_end.clear()
+    cand_loop_body.clear()
+    cand_loop_end.clear()
+    cand_wrapped.clear()
+
+    let pos = expr_start
+    let depth = 0
+    #luge
+    while (pos < expr_end) {
+        let op = inp[pos]
+        let nxt = step_instr(pos, expr_end)
+        if nxt < 0 { return false }
+
+        // Pattern 1: top-level `block 0x40; loop 0x40 ... end; end`
+        if depth == 0 and op == 2 and inp[pos + 1] == 64 and nxt < expr_end
+            and inp[nxt] == 3 and inp[nxt + 1] == 64 {
+            let loop_body = nxt + 2
+            let scan = loop_body
+            let d = 2
+            let loop_end = -1
+            let block_end = -1
+            while (scan < expr_end and d > 0) {
+                let sop = inp[scan]
+                let snxt = step_instr(scan, expr_end)
+                if snxt < 0 { return false }
+                if sop == 2 or sop == 3 or sop == 4 {
+                    d += 1
+                } else if sop == 11 {
+                    d -= 1
+                    if d == 1 and loop_end < 0 { loop_end = scan }
+                    if d == 0 { block_end = snxt }
+                }
+                scan = snxt
+            }
+            if loop_end >= 0 and block_end >= 0 and scan == block_end and loop_end + 2 == block_end {
+                cand_reg_start.push(pos)
+                cand_reg_end.push(block_end)
+                cand_loop_body.push(loop_body)
+                cand_loop_end.push(loop_end)
+                cand_wrapped.push(1)
+                pos = block_end
+                continue
+            }
+        }
+
+        // Pattern 2: top-level standalone `loop 0x40 ... end`
+        if depth == 0 and op == 3 and inp[pos + 1] == 64 {
+            let loop_body = pos + 2
+            let scan = loop_body
+            let d = 1
+            let loop_end = -1
+            while (scan < expr_end and d > 0) {
+                let sop = inp[scan]
+                let snxt = step_instr(scan, expr_end)
+                if snxt < 0 { return false }
+                if sop == 2 or sop == 3 or sop == 4 {
+                    d += 1
+                } else if sop == 11 {
+                    d -= 1
+                    if d == 0 { loop_end = scan }
+                }
+                scan = snxt
+            }
+            if loop_end >= 0 {
+                cand_reg_start.push(pos)
+                cand_reg_end.push(scan)
+                cand_loop_body.push(loop_body)
+                cand_loop_end.push(loop_end)
+                cand_wrapped.push(0)
+                pos = scan
+                continue
+            }
+        }
+
+        if op == 2 or op == 3 or op == 4 { depth += 1 }
+        else if op == 11 { depth -= 1 }
+        pos = nxt
+    }
+    return true
+}
+
+fn scan_locals(start: I32, end: I32, is_in: Bool) Void {
+    let pos = start
+    while (pos < end) {
+        let op = inp[pos]
+        if op == 32 { // local.get
+            cur_pos = pos + 1
+            let x = read_u32()
+            if is_in { in_read[x] = in_read[x] + 1 } else { out_read[x] = out_read[x] + 1 }
+        } else if op == 33 { // local.set
+            cur_pos = pos + 1
+            let x = read_u32()
+            if is_in { in_write[x] = in_write[x] + 1 }
+        } else if op == 34 { // local.tee
+            cur_pos = pos + 1
+            let x = read_u32()
+            if is_in { in_write[x] = in_write[x] + 1 }
+        }
+        pos = step_instr(pos, end)
+    }
+}
+
+/// Emit remapped loop body [start, end) into `buf`.
+fn emit_remapped(start: I32, end: I32) Void {
+    let pos = start
+    #luge
+    while (pos < end) {
+        let op = inp[pos]
+        let nxt = step_instr(pos, end)
+        if op == 32 or op == 33 or op == 34 {
+            cur_pos = pos + 1
+            let x = read_u32()
+            buf.push(op)
+            push_u32(loc_map[x])
+        } else {
+            for (pos ..< nxt) |k| { buf.push(inp[k]) }
+        }
+        pos = nxt
+    }
+}
+
+/// Optimize a single defined function `fi` (0-based in Code section).
+/// Appends the resulting body (with leading size LEB) into `out_code`.
+fn process_func(fi: I32, orig_type_count: I32, orig_func_count: I32) Void {
+    let b_start = code_start[fi]
+    let b_end = b_start + code_len[fi]
+    let t_idx = func_type_idx[fi]
+
+    // Non-func type or invalid? Copy verbatim.
+    if t_idx < 0 or t_idx >= type_is_func.len() or type_is_func[t_idx] == 0 {
+        body_buf.clear()
+        for (b_start ..< b_end) |k| { body_buf.push(inp[k]) }
+        return
+    }
+
+    // Build flat local type table: params + declared locals
+    loc_types.clear()
+    let ps = type_p_start[t_idx]
+    let pl = type_p_len[t_idx]
+    for (0 ..< pl) |i| {
+        let vt = type_vals[ps + i]
+        if not is_mvp_valtype(vt) {
+            body_buf.clear()
+            for (b_start ..< b_end) |k| { body_buf.push(inp[k]) }
+            return
+        }
+        loc_types.push(vt)
+    }
+
+    cur_pos = b_start
+    let n_groups = read_u32()
+    for (0 ..< n_groups) |_| {
+        let cnt = read_u32()
+        let vt = read_u8()
+        if not is_mvp_valtype(vt) {
+            body_buf.clear()
+            for (b_start ..< b_end) |k| { body_buf.push(inp[k]) }
+            return
+        }
+        for (0 ..< cnt) |_| { loc_types.push(vt) }
+    }
+    let locals_end = cur_pos
+    let expr_end = b_end - 1 // exclude trailing function `end` (0x0b)
+
+    if not find_candidates(locals_end, expr_end) or cand_reg_start.len() == 0 {
+        body_buf.clear()
+        for (b_start ..< b_end) |k| { body_buf.push(inp[k]) }
+        return
+    }
+
+    let total = loc_types.len()
+    in_read.resize(total)
+    in_write.resize(total)
+    out_read.resize(total)
+    loc_map.resize(total)
+
+    // Rewrite caller into `body_buf`: copy locals header first
+    body_buf.clear()
+    for (b_start ..< locals_end) |k| { body_buf.push(inp[k]) }
+
+    let copy_from = locals_end
+    for (0 ..< cand_reg_start.len()) |ci| {
+        let r_start = cand_reg_start[ci]
+        let r_end = cand_reg_end[ci]
+        let l_body = cand_loop_body[ci]
+        let l_end = cand_loop_end[ci]
+        let wrapped = cand_wrapped[ci] == 1
+
+        // Copy bytes before this candidate
+        for (copy_from ..< r_start) |k| { body_buf.push(inp[k]) }
+
+        // Check safety (minimum 12 bytes to skip trivial empty loops)
+        let safe = (l_end - l_body) >= 8 and check_region_safe(l_body, l_end, if wrapped { 1 } else { 0 })
+        if not safe {
+            for (r_start ..< r_end) |k| { body_buf.push(inp[k]) }
+            copy_from = r_end
+            continue
+        }
+
+        // Liveness analysis
+        for (0 ..< total) |x| {
+            in_read[x] = 0
+            in_write[x] = 0
+            out_read[x] = 0
+            loc_map[x] = -1
+        }
+        scan_locals(l_body, l_end, true)
+        scan_locals(locals_end, r_start, false)
+        scan_locals(r_end, expr_end, false)
+
+        h_params.clear()
+        h_outs.clear()
+        for (0 ..< total) |x| {
+            if in_read[x] > 0 or in_write[x] > 0 {
+                loc_map[x] = h_params.len()
+                h_params.push(x)
+                if in_write[x] > 0 and out_read[x] > 0 {
+                    h_outs.push(x)
+                }
+            }
+        }
+
+        // Append new helper type: 0x60 (params..., i32) -> (outs...)
+        let new_tid = orig_type_count + new_type_count
+        new_type_count += 1
+        new_types.push(96) // 0x60
+        new_types_push_u32(h_params.len() + 1)
+        for (0 ..< h_params.len()) |i| { new_types.push(loc_types[h_params[i]]) }
+        new_types.push(127) // next: i32
+        new_types_push_u32(h_outs.len())
+        for (0 ..< h_outs.len()) |i| { new_types.push(loc_types[h_outs[i]]) }
+
+        // Append new helper function index
+        let g_idx = num_imp_funcs + orig_func_count + new_func_type_idx.len()
+        new_func_type_idx.push(new_tid)
+
+        let next_loc = h_params.len()
+        let cnt_loc = h_params.len() + 1
+
+        // Build helper body in `buf`
+        buf.clear()
+        buf.push(1) // 1 local group
+        buf.push(1) // count = 1
+        buf.push(127) // i32 (cnt)
+
+        if wrapped {
+            buf.push(2)  // block
+            buf.push(64) // void
+        }
+        buf.push(3)  // loop
+        buf.push(64) // void
+
+        // Inject tier-up check:
+        // local.get cnt; i32.const 1; i32.add; local.tee cnt; local.get next; i32.eq; if
+        //   local.get 0..k; local.get next; i32.const 1; i32.shl; return_call g_idx
+        // end
+        buf.push(32); push_u32(cnt_loc)
+        buf.push(65); push_s32(1)
+        buf.push(106) // i32.add
+        buf.push(34); push_u32(cnt_loc) // local.tee
+        buf.push(32); push_u32(next_loc)
+        buf.push(70)  // i32.eq
+        buf.push(4); buf.push(64) // if void
+        for (0 ..< h_params.len()) |i| {
+            buf.push(32); push_u32(i)
+        }
+        buf.push(32); push_u32(next_loc)
+        buf.push(65); push_s32(1)
+        buf.push(116) // i32.shl
+        buf.push(18); push_u32(g_idx) // return_call g_idx
+        buf.push(11)  // end if
+
+        // Remapped loop body
+        emit_remapped(l_body, l_end)
+
+        buf.push(11) // end loop
+        if wrapped { buf.push(11) } // end block
+
+        // Push live-out values
+        for (0 ..< h_outs.len()) |i| {
+            buf.push(32); push_u32(loc_map[h_outs[i]])
+        }
+        buf.push(11) // end function
+
+        // Save helper body into `new_bodies`
+        new_body_start.push(new_bodies.len())
+        new_body_len.push(buf.len())
+        for (0 ..< buf.len()) |k| { new_bodies.push(buf[k]) }
+
+        // Replace region in caller with call g_idx(params..., threshold) + unpack outs
+        for (0 ..< h_params.len()) |i| {
+            body_buf.push(32); body_push_u32(h_params[i])
+        }
+        body_buf.push(65); body_push_s32(g_threshold)
+        body_buf.push(16); body_push_u32(g_idx) // call g_idx
+        let oi = h_outs.len()
+        while (oi > 0) {
+            oi -= 1
+            body_buf.push(33); body_push_u32(h_outs[oi])
+        }
+
+        g_outlined += 1
+        copy_from = r_end
+    }
+
+    // Copy remaining bytes of caller (including final `end`)
+    for (copy_from ..< b_end) |k| { body_buf.push(inp[k]) }
+}
+
+// ── Top-level module optimizer ───────────────────────────────────────────────
+
+fn run_optimize(length: I32, threshold: I32) I32 {
+    inp_len = length
+    g_threshold = if threshold > 0 { threshold } else { 1024 }
+    g_outlined = 0
+    num_imp_funcs = 0
+    new_type_count = 0
+
+    out.clear()
+    sec_id.clear()
+    sec_start.clear()
+    sec_len.clear()
+    type_raw_start.clear()
+    type_raw_len.clear()
+    type_is_func.clear()
+    type_p_start.clear()
+    type_p_len.clear()
+    type_r_start.clear()
+    type_r_len.clear()
+    type_vals.clear()
+    new_types.clear()
+    func_type_idx.clear()
+    new_func_type_idx.clear()
+    code_start.clear()
+    code_len.clear()
+    new_bodies.clear()
+    new_body_start.clear()
+    new_body_len.clear()
+
+    if inp_len < 8 { return -1 }
+    // Verify \0asm\1\0\0\0
+    if inp[0] != 0 or inp[1] != 97 or inp[2] != 115 or inp[3] != 109 { return -1 }
+
+    // Pass 1: parse sections
+    cur_pos = 8
+    #luge
+    while (cur_pos < inp_len) {
+        let sid = read_u8()
+        let slen = read_u32()
+        let sstart = cur_pos
+        sec_id.push(sid)
+        sec_start.push(sstart)
+        sec_len.push(slen)
+        if sid == 1 { parse_type_section(sstart, slen) }
+        else if sid == 2 { parse_import_section(sstart) }
+        else if sid == 3 { parse_function_section(sstart) }
+        else if sid == 10 { parse_code_section(sstart) }
+        cur_pos = sstart + slen
+    }
+
+    // Pass 2: transform all defined functions and collect rewritten Code section payload
+    let orig_types = type_is_func.len()
+    let orig_funcs = func_type_idx.len()
+
+    let n_code = code_start.len()
+    let rw_starts = Array[I32].new(n_code, 0)
+    let rw_lens = Array[I32].new(n_code, 0)
+    rw_bytes.clear()
+    #luge
+    for (0 ..< n_code) |fi| {
+        process_func(fi, orig_types, orig_funcs)
+        rw_starts[fi] = rw_bytes.len()
+        rw_lens[fi] = body_buf.len()
+        for (0 ..< body_buf.len()) |k| { rw_bytes.push(body_buf[k]) }
+    }
+
+    // Pass 3: emit final Wasm module into `out`
+    for (0 ..< 8) |k| { out.push(inp[k]) }
+
+    for (0 ..< sec_id.len()) |si| {
+        let sid = sec_id[si]
+        let sstart = sec_start[si]
+        let slen = sec_len[si]
+        if sid == 1 and new_type_count > 0 {
+            // Re-emit Type section with appended helper types
+            buf.clear()
+            push_u32(orig_types + new_type_count)
+            // Copy original type bytes (after original count LEB)
+            cur_pos = sstart
+            skip_leb()
+            for (cur_pos ..< sstart + slen) |k| { buf.push(inp[k]) }
+            for (0 ..< new_types.len()) |k| { buf.push(new_types[k]) }
+            out.push(1)
+            out_u32(buf.len())
+            for (0 ..< buf.len()) |k| { out.push(buf[k]) }
+        } else if sid == 3 and new_func_type_idx.len() > 0 {
+            // Re-emit Function section with appended helper type indices
+            buf.clear()
+            push_u32(orig_funcs + new_func_type_idx.len())
+            for (0 ..< orig_funcs) |i| { push_u32(func_type_idx[i]) }
+            for (0 ..< new_func_type_idx.len()) |i| { push_u32(new_func_type_idx[i]) }
+            out.push(3)
+            out_u32(buf.len())
+            for (0 ..< buf.len()) |k| { out.push(buf[k]) }
+        } else if sid == 10 and g_outlined > 0 {
+            // Re-emit Code section with rewritten original bodies + appended helper bodies
+            buf.clear()
+            push_u32(n_code + new_body_start.len())
+            for (0 ..< n_code) |fi| {
+                let s = rw_starts[fi]
+                let l = rw_lens[fi]
+                push_u32(l)
+                for (s ..< s + l) |k| { buf.push(rw_bytes[k]) }
+            }
+            for (0 ..< new_body_start.len()) |hi| {
+                let s = new_body_start[hi]
+                let l = new_body_len[hi]
+                push_u32(l)
+                for (s ..< s + l) |k| { buf.push(new_bodies[k]) }
+            }
+            out.push(10)
+            out_u32(buf.len())
+            for (0 ..< buf.len()) |k| { out.push(buf[k]) }
+        } else {
+            // Copy section verbatim
+            out.push(sid)
+            out_u32(slen)
+            for (sstart ..< sstart + slen) |k| { out.push(inp[k]) }
+        }
+    }
+    return out.len()
+}
+
+vec rw_bytes: U8
+
+lib {
+    fn alloc_in(n: I32) Void {
+        inp.resize(n)
+    }
+    fn optimize(n: I32, threshold: I32) I32 {
+        return run_optimize(n, threshold)
+    }
+    fn outlined_count() I32 => g_outlined
+}

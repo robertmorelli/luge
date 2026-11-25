@@ -1,0 +1,12 @@
+{
+  "name": "luge",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "luge": "./cli.mjs"
+  },
+  "scripts": {
+    "build": "node ../utu/cli/utu.mjs build luge.utu -o dist -O fast --luge --target node",
+    "test": "bun test.mjs"
+  }
+}
