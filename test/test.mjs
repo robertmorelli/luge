@@ -63,7 +63,7 @@ const inPath = path.join(tmp, "work.wasm");
 const outPath = path.join(tmp, "work.luge.wasm");
 fs.writeFileSync(inPath, wasm);
 
-const cli = spawnSync("bun", ["cli.mjs", inPath, "-o", outPath], { encoding: "utf8" });
+const cli = spawnSync("bun", ["bin/luge.mjs", inPath, "-o", outPath], { encoding: "utf8" });
 process.stdout.write(cli.stdout);
 if (cli.status !== 0) {
   process.stderr.write(cli.stderr);

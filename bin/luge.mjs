@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import fs from "node:fs";
 import path from "node:path";
-import { exports as luge } from "./dist/luge.mjs";
+import { exports as luge } from "../dist/luge.mjs";
 
 const args = process.argv.slice(2);
 let input = null;

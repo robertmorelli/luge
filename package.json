@@ -3,10 +3,10 @@
   "version": "0.1.0",
   "type": "module",
   "bin": {
-    "luge": "./cli.mjs"
+    "luge": "./bin/luge.mjs"
   },
   "scripts": {
-    "build": "node ../utu/cli/utu.mjs build luge.utu -o dist -O fast --luge --target node",
-    "test": "bun test.mjs"
+    "build": "node ../utu/cli/utu.mjs build src/luge.utu -o dist -O fast --luge --target node",
+    "test": "bun test/test.mjs"
   }
 }

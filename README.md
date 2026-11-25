@@ -1,8 +1,24 @@
 # luge
 
-Standalone Wasm-to-Wasm binary optimizer (written in Utu, compiled with `--luge`, wrapped as a Bun CLI) that outlines outermost loops into helper functions with an exponential-backoff `return_call` (`1024, 2048, 4096, ...`) so V8 (Liftoff → TurboFan) and SpiderMonkey (Baseline → Ion) can tier up single-call hot loops mid-run.
+A Wasm-to-Wasm optimizer that helps single-call hot loops tier up.
+
+V8 and SpiderMonkey only swap in optimized Wasm code at function entry,
+so a long loop inside a function that runs once can stay stuck in the baseline
+tier. luge moves each outermost loop into its own helper function that
+re-enters itself with `return_call` after 1024, 2048, 4096, … iterations,
+which gives the engine a chance to switch to optimized code partway through.
+
+Written in [Utu](https://github.com/robertmorelli/utu).
+
+## Usage
 
 ```sh
-bun cli.mjs input.wasm -o output.wasm
-bun test.mjs
+bun bin/luge.mjs input.wasm -o output.wasm [--threshold 1024]
+```
+
+## Development
+
+```sh
+bun run build   # needs ../utu checked out next to this repo
+bun run test
 ```
